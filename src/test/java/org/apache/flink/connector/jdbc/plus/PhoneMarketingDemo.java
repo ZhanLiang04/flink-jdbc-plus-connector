@@ -220,7 +220,8 @@ public class PhoneMarketingDemo {
 
         // 触发 Flink Job 执行
         tenv.executeSql("select count(*) from phone_marketing_src").print();
-//        tenv.executeSql("INSERT INTO sink_print SELECT * FROM phone_marketing_src").await();
+        //        tenv.executeSql("INSERT INTO sink_print SELECT * FROM
+        // phone_marketing_src").await();
     }
 
     // =========================================================================

@@ -55,6 +55,7 @@ public class TableInfo implements Serializable {
     public String getSplitKeyColumn() {
         return splitKeyColumn;
     }
+
     public int getSplitKeyJdbcType() {
         return splitKeyJdbcType;
     }
