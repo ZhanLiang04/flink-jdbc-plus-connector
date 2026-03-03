@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Logback 配置（仅用于本地 Demo / 单元测试）
+  =====================================================================
+  本文件在 src/test/resources/ 下，只影响 test-compile 后本地运行的输出。
+  生产 Flink 集群部署时，由集群自身的 logback 配置接管，此文件不打包进 jar。
+
+  ▶ 调整日志级别：修改下方各 <logger> 的 level 属性即可，可选值：
+      TRACE  DEBUG  INFO  WARN  ERROR  OFF
+
+  ▶ 快速调整方法：
+    - 只看本 connector 日志   → 将 jdbc-plus.level = DEBUG
+    - 屏蔽所有 Flink 框架噪音 → 将 flink.level = ERROR
+    - 彻底安静               → 将 root.level = ERROR
+  =====================================================================
+-->
+<configuration scan="true" scanPeriod="30 seconds">
+
+    <!-- ================================================================
+         属性：统一在顶部修改，无需深入 XML 内部
+         ================================================================ -->
+
+    <!-- 本 connector 的日志级别（org.apache.flink.connector.jdbc.plus.*） -->
+    <property name="jdbc-plus.level" value="INFO"/>
+
+    <!-- Flink 框架内部日志级别（SourceCoordinator、TaskExecutor 等） -->
+    <property name="flink.level"     value="INFO"/>
+
+    <!-- Akka / Pekko 内部（Flink RPC 层） -->
+    <property name="akka.level"      value="WARN"/>
+
+    <!-- Netty / Hadoop 等底层组件 -->
+    <property name="thirdparty.level" value="WARN"/>
+
+    <!-- 根日志默认级别（兜底） -->
+    <property name="root.level"      value="WARN"/>
+
+
+    <!-- ================================================================
+         Appender：控制台彩色输出
+         ================================================================ -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <!--
+              格式说明：
+                %d{HH:mm:ss.SSS}  时间（时:分:秒.毫秒）
+                %-5level          日志级别，左对齐占 5 位
+                [%thread]         线程名
+                %logger{40}       Logger 名称，最多 40 个字符（超出则缩写包名）
+                %msg%n            消息 + 换行
+            -->
+            <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{40} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+
+    <!-- ================================================================
+         本项目 connector 包：按 jdbc-plus.level 输出
+         ================================================================ -->
+    <logger name="org.apache.flink.connector.jdbc.plus" level="${jdbc-plus.level}" additivity="false">
+        <appender-ref ref="CONSOLE"/>
+    </logger>
+
+
+    <!-- ================================================================
+         Flink 框架核心包
+         ================================================================ -->
+    <!-- Source 协调器（EnumeratorContext、SourceCoordinator） -->
+    <logger name="org.apache.flink.runtime.source"           level="${flink.level}"/>
+    <!-- SplitFetcher / SourceReaderBase -->
+    <logger name="org.apache.flink.connector.base"           level="${flink.level}"/>
+    <!-- TaskExecutor、JobManager、CheckpointCoordinator 等 -->
+    <logger name="org.apache.flink.runtime"                  level="${flink.level}"/>
+    <!-- Streaming Task、Operator -->
+    <logger name="org.apache.flink.streaming"                level="${flink.level}"/>
+    <!-- Table Planner / SQL -->
+    <logger name="org.apache.flink.table"                    level="${flink.level}"/>
+    <!-- Flink Client / MiniCluster -->
+    <logger name="org.apache.flink.client"                   level="${flink.level}"/>
+    <!-- Metrics -->
+    <logger name="org.apache.flink.metrics"                  level="WARN"/>
+
+
+    <!-- ================================================================
+         第三方底层噪音：默认 WARN
+         ================================================================ -->
+    <logger name="akka"                                      level="${akka.level}"/>
+    <logger name="com.typesafe.config"                       level="${akka.level}"/>
+    <logger name="io.netty"                                  level="${thirdparty.level}"/>
+    <logger name="org.apache.hadoop"                         level="${thirdparty.level}"/>
+    <logger name="org.apache.zookeeper"                      level="${thirdparty.level}"/>
+    <logger name="com.mysql"                                 level="${thirdparty.level}"/>
+
+
+    <!-- ================================================================
+         根 Logger（兜底，未匹配以上任何包的日志）
+         ================================================================ -->
+    <root level="${root.level}">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+
+</configuration>

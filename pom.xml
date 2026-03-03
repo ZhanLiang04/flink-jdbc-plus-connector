@@ -1,0 +1,212 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>org.apache.flink</groupId>
+    <artifactId>flink-jdbc-plus</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+    <name>Flink JDBC Plus Connector</name>
+    <description>
+        Enhanced Flink JDBC source connector with non-uniform chunk splitting,
+        multi-table support, and proper FLIP-27 Source API implementation.
+    </description>
+
+    <properties>
+        <maven.compiler.source>8</maven.compiler.source>
+        <maven.compiler.target>8</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <flink.version>1.17.2</flink.version>
+        <slf4j.version>1.7.36</slf4j.version>
+        <junit.version>5.9.3</junit.version>
+    </properties>
+
+    <dependencies>
+        <!-- Flink Core (Source API / FLIP-27) -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-core</artifactId>
+            <version>${flink.version}</version>
+        </dependency>
+
+        <!-- Flink Connector Base (SourceReaderBase, SplitFetcherManager, etc.) -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-base</artifactId>
+            <version>${flink.version}</version>
+
+        </dependency>
+
+        <!-- Flink Table Common (RowData, DataType, DynamicTableSource) -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-table-common</artifactId>
+            <version>${flink.version}</version>
+        </dependency>
+
+        <!-- Flink Table Runtime (InternalTypeInfo) -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-table-runtime</artifactId>
+            <version>${flink.version}</version>
+        </dependency>
+
+        <!-- Flink Java API (for DataStream) -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-java</artifactId>
+            <version>${flink.version}</version>
+        </dependency>
+
+        <!-- Logging -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+
+        <!-- MySQL JDBC Driver.
+             scope=provided: excluded from the shaded jar — users must place
+             the driver on the Flink cluster's classpath themselves. -->
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <version>8.3.0</version>
+        </dependency>
+
+        <!-- Test dependencies -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+        </dependency>
+        <!-- Logback: SLF4J binding for test / demo execution.
+             1.2.x is required for SLF4J 1.7.x; do NOT use 1.3+ (requires SLF4J 2.x).
+             Reads src/test/resources/logback-test.xml at test-compile time. -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>1.2.12</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- H2 in-memory DB for unit tests (no MySQL required) -->
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <version>2.2.224</version>
+        </dependency>
+
+        <!-- Flink DataStream API for integration tests -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-streaming-java</artifactId>
+            <version>${flink.version}</version>
+        </dependency>
+
+        <!-- Flink local execution / MiniCluster -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-clients</artifactId>
+            <version>${flink.version}</version>
+        </dependency>
+
+        <!-- Note: MySQL driver is available at test-time via the 'provided' entry above.
+             No separate test-scope entry needed. -->
+
+        <!-- Flink Table Planner: provides ExecutorFactory required by TableEnvironment.create().
+             Only needed when running Table/SQL API locally (demo / integration tests). -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-table-planner_2.12</artifactId>
+            <version>${flink.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+                <configuration>
+                    <source>8</source>
+                    <target>8</target>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.0</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <shadedArtifactAttached>true</shadedArtifactAttached>
+                            <shadedClassifierName>jar-with-dependencies</shadedClassifierName>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.1.2</version>
+            </plugin>
+
+            <!-- ============================================================
+                 Spotless：代码格式化
+                 常用命令：
+                   mvn spotless:apply   — 自动修复所有格式问题（写入磁盘）
+                   mvn spotless:check   — 仅检查，不修改（CI 用）
+                 ============================================================ -->
+            <plugin>
+                <groupId>com.diffplug.spotless</groupId>
+                <artifactId>spotless-maven-plugin</artifactId>
+                <version>2.43.0</version>
+                <configuration>
+
+                    <!-- ── Java 源文件 ────────────────────────────────── -->
+                    <java>
+                        <!-- 作用范围：src/main 和 src/test 下所有 .java -->
+                        <includes>
+                            <include>src/main/java/**/*.java</include>
+                            <include>src/test/java/**/*.java</include>
+                        </includes>
+
+                        <!-- 1. 移除未使用的 import -->
+                        <removeUnusedImports/>
+
+                        <!-- 2. Google Java Format
+                             style=AOSP 缩进 4 空格（更符合 Apache 社区习惯）；
+                             若想用 2 空格的原版 Google 风格，去掉 <style> 标签即可 -->
+                        <googleJavaFormat>
+                            <version>1.15.0</version>
+                            <style>AOSP</style>
+                            <!-- 同时对 import 分组排序 -->
+                            <reorderImports>true</reorderImports>
+                        </googleJavaFormat>
+
+                        <!-- 3. 文件末尾必须有换行符 -->
+                        <endWithNewline/>
+                    </java>
+
+                    <!-- ── XML 文件（pom.xml 等）────────────────────────── -->
+                    <pom>
+                        <includes>
+                            <include>pom.xml</include>
+                        </includes>
+                        <!-- 保持 pom.xml 末尾有换行 -->
+                        <endWithNewline/>
+                    </pom>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
