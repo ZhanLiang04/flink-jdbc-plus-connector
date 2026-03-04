@@ -65,14 +65,18 @@ public interface JdbcDialect extends Serializable {
      *   <li>Both: {@code WHERE splitKey > ? AND splitKey <= ?}
      * </ul>
      *
-     * When {@code split.getOffset() > 0} the query appends {@code OFFSET} so the reader can skip
-     * already-emitted rows after a failover.
+     * <p>When {@code split.getOffset() > 0} the query appends {@code OFFSET} so the reader can
+     * skip already-emitted rows after a failover.
      *
-     * @param split the split to read
+     * <p>The JDBC fetch size (for server-side cursor / streaming) is <strong>not</strong> a
+     * parameter here; it is applied separately via
+     * {@link java.sql.PreparedStatement#setFetchSize} in the reader layer, keeping SQL generation
+     * decoupled from driver-level tuning.
+     *
+     * @param split   the split to read
      * @param columns comma-separated column list, or {@code "*"}
-     * @param fetchSize JDBC fetch-size hint (appended as LIMIT when > 0); 0 = no limit
      */
-    String buildSplitScanQuery(JdbcSourceSplit split, String columns, int fetchSize);
+    String buildSplitScanQuery(JdbcSourceSplit split, String columns);
 
     /**
      * Builds the SQL to list all table names in a database.

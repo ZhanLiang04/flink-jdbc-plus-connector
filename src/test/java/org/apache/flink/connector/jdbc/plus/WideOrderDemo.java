@@ -152,7 +152,8 @@ public class WideOrderDemo {
                         + ")");
 
         // 触发 Flink Job 执行
-        tenv.executeSql("INSERT INTO sink_print SELECT * FROM wide_order_src").await();
+        tenv.executeSql("SELECT COUNT(*) FROM wide_order_src").print();
+        // tenv.executeSql("INSERT INTO sink_print SELECT * FROM wide_order_src").await();
     }
 
     // =========================================================================
@@ -195,7 +196,7 @@ public class WideOrderDemo {
                         .password(PASSWORD)
                         .database(DATABASE)
                         .tableList("t_wide_order")
-                        .chunkSize(50)
+                        .chunkSize(500)
                         .fetchSize(256)
                         .rowType(rowType)
                         .build();

@@ -63,16 +63,23 @@ public class MySqlDialect implements JdbcDialect {
     /**
      * {@inheritDoc}
      *
-     * <p>Example (middle chunk with offset resumption):
+     * <p>Example (middle chunk, cold start):
      *
      * <pre>
      *   SELECT * FROM `mydb`.`orders`
      *   WHERE `id` &gt; ? AND `id` &lt;= ?
-     *   LIMIT 1024 OFFSET 512
+     * </pre>
+     *
+     * <p>Example (middle chunk resumed from checkpoint at offset 512):
+     *
+     * <pre>
+     *   SELECT * FROM `mydb`.`orders`
+     *   WHERE `id` &gt; ? AND `id` &lt;= ?
+     *   LIMIT 18446744073709551615 OFFSET 512
      * </pre>
      */
     @Override
-    public String buildSplitScanQuery(JdbcSourceSplit split, String columns, int fetchSize) {
+    public String buildSplitScanQuery(JdbcSourceSplit split, String columns) {
         String quotedTable = quoteFullTableName(split.getFullTableName());
         String quotedKey = quoteIdentifier(split.getSplitKeyColumn());
         StringBuilder sb = new StringBuilder();
@@ -96,14 +103,9 @@ public class MySqlDialect implements JdbcDialect {
             }
         }
 
-        if (fetchSize > 0) {
-            sb.append(" LIMIT ").append(fetchSize);
-            if (split.getOffset() > 0) {
-                sb.append(" OFFSET ").append(split.getOffset());
-            }
-        } else if (split.getOffset() > 0) {
-            // No explicit fetch size, but we still need an OFFSET.
-            // MySQL requires LIMIT before OFFSET; use a large LIMIT.
+        // OFFSET is only appended when resuming from a checkpoint (offset > 0).
+        // MySQL requires LIMIT before OFFSET; we use the maximum unsigned BIGINT as a no-op cap.
+        if (split.getOffset() > 0) {
             sb.append(" LIMIT 18446744073709551615 OFFSET ").append(split.getOffset());
         }
 

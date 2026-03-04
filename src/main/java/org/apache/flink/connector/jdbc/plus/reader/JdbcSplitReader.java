@@ -200,7 +200,7 @@ public class JdbcSplitReader implements SplitReader<RowData, JdbcSourceSplit> {
         currentSplitId = split.splitId();
         ensureConnectionOpen();
 
-        String sql = dialect.buildSplitScanQuery(split, "*", options.getFetchSize());
+        String sql = dialect.buildSplitScanQuery(split, "*");
         LOG.debug("Opening split {}: {}", currentSplitId, sql);
 
         currentStatement =

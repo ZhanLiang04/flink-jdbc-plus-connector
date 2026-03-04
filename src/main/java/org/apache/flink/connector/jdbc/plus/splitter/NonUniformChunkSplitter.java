@@ -13,6 +13,7 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.function.Consumer;
 
 /**
  * Splits a JDBC table into evenly-sized chunks based on <em>actual data distribution</em> rather
@@ -135,6 +136,56 @@ public class NonUniformChunkSplitter {
 
         LOG.info("Non-uniform chunk split for {} produced {} splits.", fullTable, splits.size());
         return splits;
+    }
+
+    /**
+     * Streaming variant of {@link #split}: emits splits one by one via {@code consumer} as each
+     * chunk boundary is discovered, instead of collecting them all first.
+     *
+     * <p>This lets the enumerator start distributing splits to readers immediately, without waiting
+     * for the entire table to be analysed — the key enabler for the "split-while-distribute"
+     * pipeline.
+     *
+     * @param connection an open JDBC connection (not closed by this method)
+     * @param tableInfo  table metadata including the split key column
+     * @param consumer   called once per split, in key-order; must be non-blocking
+     */
+    public void splitStreaming(
+            Connection connection, TableInfo tableInfo, Consumer<JdbcSourceSplit> consumer)
+            throws SQLException {
+
+        String fullTable = tableInfo.getFullTableName();
+        String splitKey = tableInfo.getSplitKeyColumn();
+
+        LOG.info(
+                "Starting streaming split for table={}, splitKey={}, chunkSize={}",
+                fullTable,
+                splitKey,
+                chunkSize);
+
+        Object[] minMax = queryMinMax(connection, fullTable, splitKey);
+        if (minMax[0] == null) {
+            LOG.info("Table {} is empty; emitting a single full-table split.", fullTable);
+            consumer.accept(makeSplit(fullTable, splitKey, 0, null, null));
+            return;
+        }
+
+        int idx = 0;
+        Comparable<?> chunkStart = null;
+        while (true) {
+            Comparable<?> nextBoundary =
+                    queryNextBoundary(connection, fullTable, splitKey, chunkStart);
+            if (nextBoundary == null) {
+                consumer.accept(makeSplit(fullTable, splitKey, idx, chunkStart, null));
+                LOG.debug("Table {} last split #{}: ({}, ∞)", fullTable, idx, chunkStart);
+                break;
+            }
+            consumer.accept(makeSplit(fullTable, splitKey, idx, chunkStart, nextBoundary));
+            LOG.debug("Table {} split #{}: ({}, {}]", fullTable, idx, chunkStart, nextBoundary);
+            chunkStart = nextBoundary;
+            idx++;
+        }
+        LOG.info("Streaming split for {} finished, {} splits emitted.", fullTable, idx + 1);
     }
 
     // -------------------------------------------------------------------------

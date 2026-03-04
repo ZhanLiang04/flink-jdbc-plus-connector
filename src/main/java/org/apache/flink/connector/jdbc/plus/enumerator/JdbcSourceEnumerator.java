@@ -22,6 +22,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Queue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.annotation.Nullable;
 
@@ -29,28 +31,38 @@ import javax.annotation.Nullable;
  * JobManager-side component of the FLIP-27 source that discovers and assigns {@link
  * JdbcSourceSplit}s to {@code SourceReader}s running on TaskManagers.
  *
- * <h2>JM / TM decoupling</h2>
+ * <h2>Split-while-distribute pipeline</h2>
  *
- * <p>This class runs exclusively on the JobManager. It never reads actual table data; its sole
- * responsibility is <em>split management</em>:
+ * <p>This enumerator implements a <em>producer/consumer pipeline</em> so that splits are
+ * distributed to readers as soon as they are ready, without waiting for all splits to be
+ * enumerated first:
  *
  * <ol>
- *   <li>On {@link #start()}: schedules table/chunk discovery as an async call via {@link
- *       SplitEnumeratorContext#callAsync} so the JM's main thread is never blocked.
- *   <li>On {@link #handleSplitRequest}: fulfils pending reader requests from a shared {@link
- *       Queue}, or queues the request for later fulfillment once discovery completes.
- *   <li>On {@link #addSplitsBack}: re-queues splits that were returned by a failed TaskManager
- *       subtask.
- *   <li>On {@link #snapshotState}: serialises pending splits and remaining tables so Flink can
- *       restore the enumerator after a JobManager failure.
+ *   <li>{@link #start()} submits table/chunk discovery as a single {@link
+ *       SplitEnumeratorContext#callAsync} call. The callable runs on a background thread and
+ *       streams each split into a {@link LinkedBlockingQueue} the moment its boundary is found.
+ *   <li>After each enqueue the background thread calls {@link #scheduleDrainIfNeeded()}: if no
+ *       drain is already pending it submits a lightweight no-op {@code callAsync} whose callback
+ *       ({@link #drainQueueAndFulfillBacklog}) runs on the JM main thread, drains all buffered
+ *       splits into {@link #pendingSplits}, and assigns them to any waiting readers.
+ *   <li>When a TM calls {@link #handleSplitRequest} the enumerator eagerly drains the shared queue
+ *       before looking in {@link #pendingSplits}, so splits are delivered with minimal latency.
+ *   <li>When discovery finishes, {@link #onDiscoveryComplete} performs a final drain, sets
+ *       {@link #allSplitsCreated}, and signals "no more splits" to any still-waiting readers.
  * </ol>
  *
- * <h2>Communication model</h2>
+ * <h2>Thread safety</h2>
  *
- * <p>Readers request splits by calling {@link SplitEnumeratorContext#sendSplitRequest()}. The
- * enumerator responds with either an assigned split or {@link
- * SplitEnumeratorContext#signalNoMoreSplits(int)}. The exchange is purely message-based with <em>no
- * shared state</em> between JM and TM — the canonical FLIP-27 producer/consumer pattern.
+ * <p>{@link #splitQueue} is the only object shared between the background thread and the JM main
+ * thread. It is a {@link LinkedBlockingQueue} (thread-safe). All other state ({@link
+ * #pendingSplits}, {@link #splitRequestBacklog}, {@link #allSplitsCreated}) is accessed
+ * exclusively on the JM main thread — either inside a {@code callAsync} handler or inside the
+ * {@link SplitEnumerator} interface methods, which Flink guarantees to run on the coordinator
+ * thread.
+ *
+ * <p>{@link #drainScheduled} is an {@link AtomicBoolean} that acts as a "coalescing" guard: many
+ * splits can be produced between two consecutive JM-thread drain runs, but only one drain callback
+ * is ever queued at a time, preventing mailbox flooding.
  */
 public class JdbcSourceEnumerator
         implements SplitEnumerator<JdbcSourceSplit, JdbcSourceEnumeratorState> {
@@ -61,27 +73,43 @@ public class JdbcSourceEnumerator
     private final JdbcPlusOptions options;
     private final JdbcDialect dialect;
 
-    // ── Mutable state (all access on JM main thread via callAsync handler) ──
+    // ── JM-thread-only state ─────────────────────────────────────────────────
 
     /** Splits ready to be assigned but not yet sent to any reader. */
     private final Queue<JdbcSourceSplit> pendingSplits;
 
     /**
-     * Tables that still need to be split. Populated from the checkpoint state on restore; used to
-     * re-run discovery for tables whose splits were lost.
+     * Tables that still need to be split. Populated on restore from checkpoint so that tables
+     * whose splits were not yet fully emitted can be re-discovered.
      */
     private final List<String> remainingTables;
 
     /**
-     * Subtask IDs waiting for a split that is not yet available (discovery in progress). When
-     * discovery completes, these are fulfilled immediately.
+     * Subtask IDs waiting for a split that is not yet available (discovery in progress). Drained
+     * whenever new splits arrive or discovery completes.
      */
     private final Map<Integer, String> splitRequestBacklog;
 
-    /** True once all table splits have been enumerated. */
+    /** True once all table splits have been enumerated and transferred to {@link #pendingSplits}. */
     private volatile boolean allSplitsCreated;
 
-    // ── Constructor for fresh start ──
+    // ── Cross-thread bridge ──────────────────────────────────────────────────
+
+    /**
+     * Pipe between the background discovery thread (producer) and the JM main thread (consumer).
+     * The background thread offers splits here; the JM thread drains them into {@link
+     * #pendingSplits}.
+     */
+    private final LinkedBlockingQueue<JdbcSourceSplit> splitQueue;
+
+    /**
+     * Guards against enqueueing redundant drain callbacks. The background thread does a CAS from
+     * {@code false → true} before scheduling a drain; the drain handler resets it to {@code false}
+     * when it starts. This way many splits can be batched into a single drain run.
+     */
+    private final AtomicBoolean drainScheduled;
+
+    // ── Constructors ─────────────────────────────────────────────────────────
 
     public JdbcSourceEnumerator(
             SplitEnumeratorContext<JdbcSourceSplit> context,
@@ -89,8 +117,6 @@ public class JdbcSourceEnumerator
             JdbcDialect dialect) {
         this(context, options, dialect, null);
     }
-
-    // ── Constructor for restore from checkpoint ──
 
     public JdbcSourceEnumerator(
             SplitEnumeratorContext<JdbcSourceSplit> context,
@@ -103,6 +129,8 @@ public class JdbcSourceEnumerator
         this.pendingSplits = new ArrayDeque<>();
         this.remainingTables = new ArrayList<>();
         this.splitRequestBacklog = new HashMap<>();
+        this.splitQueue = new LinkedBlockingQueue<>();
+        this.drainScheduled = new AtomicBoolean(false);
 
         if (restoredState != null) {
             pendingSplits.addAll(restoredState.getPendingSplits());
@@ -120,50 +148,48 @@ public class JdbcSourceEnumerator
     // -------------------------------------------------------------------------
 
     /**
-     * Triggers asynchronous table and chunk discovery.
+     * Kicks off asynchronous split discovery.
      *
-     * <p>The heavy JDBC work (connecting, querying MIN/MAX, walking boundaries) is executed on a
-     * background thread via {@link SplitEnumeratorContext#callAsync}. The callback {@link
-     * #onSplitsDiscovered} is invoked on the JM main thread, so all state mutations are
-     * thread-safe.
+     * <p>The JDBC work runs on a background thread via {@link SplitEnumeratorContext#callAsync}.
+     * Each split is published to {@link #splitQueue} the moment it is computed; a drain callback
+     * is then coalesced-scheduled on the JM main thread so splits flow to readers immediately.
      */
     @Override
     public void start() {
         if (allSplitsCreated) {
             LOG.info("All splits already created (restored from checkpoint); skipping discovery.");
+            fulfillBacklog();
             return;
         }
-        LOG.info("Starting async table/chunk discovery.");
-        context.callAsync(this::discoverAllSplits, this::onSplitsDiscovered);
+        LOG.info("Starting async split-while-distribute discovery.");
+        context.callAsync(this::discoverAndPublishSplits, this::onDiscoveryComplete);
     }
 
     /**
      * Called when a TaskManager subtask requests a new split.
      *
-     * <p>If a pending split is available, it is assigned immediately. Otherwise the request is
-     * placed in the backlog and fulfilled later when discovery completes, or the subtask is told
-     * "no more splits" if all work is done.
+     * <p>Eagerly drains {@link #splitQueue} before consulting {@link #pendingSplits} so that
+     * splits produced by the background thread since the last drain are not delayed.
      */
     @Override
     public void handleSplitRequest(int subtaskId, @Nullable String requesterHostname) {
         LOG.debug("Split request from subtask {} (host={})", subtaskId, requesterHostname);
+        drainSharedQueue();
         assignNextSplitOrEnqueue(subtaskId);
     }
 
     /**
-     * Called when a TaskManager subtask fails and its assigned splits must be re-processed. The
-     * splits are returned to the head of the pending queue so they are reassigned promptly.
+     * Re-queues splits returned by a failed TaskManager subtask to the front of the pending queue
+     * so they are retried before newly discovered splits.
      */
     @Override
     public void addSplitsBack(List<JdbcSourceSplit> splits, int subtaskId) {
         LOG.info("Subtask {} failed; re-queuing {} splits.", subtaskId, splits.size());
-        // Add to front so failed splits are retried before newly discovered ones.
         List<JdbcSourceSplit> reversed = new ArrayList<>(splits);
         Collections.reverse(reversed);
         reversed.forEach(s -> ((ArrayDeque<JdbcSourceSplit>) pendingSplits).addFirst(s));
     }
 
-    /** No-op: for a bounded batch source there is nothing to do when a subtask restarts. */
     @Override
     public void addReader(int subtaskId) {
         LOG.debug("New reader registered: subtask {}", subtaskId);
@@ -176,83 +202,148 @@ public class JdbcSourceEnumerator
     @Override
     public JdbcSourceEnumeratorState snapshotState(long checkpointId) throws Exception {
         LOG.debug("Snapshotting enumerator state at checkpoint {}", checkpointId);
+        // Drain cross-thread queue so the snapshot is consistent.
+        drainSharedQueue();
         return new JdbcSourceEnumeratorState(
                 new ArrayList<>(pendingSplits), new ArrayList<>(remainingTables), allSplitsCreated);
     }
 
     @Override
     public void close() {
-        // Nothing to close; JDBC connection is opened only during discoverAllSplits.
+        // The background callAsync thread is managed by Flink; nothing to close here.
     }
 
     // -------------------------------------------------------------------------
-    // Async discovery (runs on a background thread)
+    // Background thread — produces splits into splitQueue
     // -------------------------------------------------------------------------
 
     /**
-     * Opens a JDBC connection, discovers all tables, and splits each one. This method is executed
-     * on a non-JM thread.
+     * Runs on a Flink-managed background thread. Connects to the database, discovers all tables,
+     * and for each table calls {@link NonUniformChunkSplitter#splitStreaming} which invokes the
+     * provided consumer once per split. The consumer immediately offers the split to {@link
+     * #splitQueue} and triggers a coalesced drain on the JM main thread.
      *
-     * @return list of all discovered splits
+     * <p>No JM-thread state is accessed here — only {@link #splitQueue} (thread-safe) and {@link
+     * #drainScheduled} (atomic).
      */
-    private List<JdbcSourceSplit> discoverAllSplits() throws Exception {
-        LOG.info("Connecting to JDBC for split discovery: {}", options.getUrl());
+    private Void discoverAndPublishSplits() throws Exception {
+        LOG.info("Background discovery thread started; connecting to {}", options.getUrl());
         try (Connection conn = openConnection()) {
             TableDiscovery discovery = new TableDiscovery(options, dialect);
             List<TableInfo> tables = discovery.discoverTables(conn);
+            LOG.info("Discovered {} table(s) to split.", tables.size());
 
             NonUniformChunkSplitter splitter =
                     new NonUniformChunkSplitter(dialect, options.getChunkSize());
 
-            List<JdbcSourceSplit> allSplits = new ArrayList<>();
             for (TableInfo table : tables) {
-                LOG.info("Splitting table: {}", table.getFullTableName());
-                List<JdbcSourceSplit> tableSplits = splitter.split(conn, table);
-                allSplits.addAll(tableSplits);
-                LOG.info(
-                        "Table {} produced {} splits.",
-                        table.getFullTableName(),
-                        tableSplits.size());
+                LOG.info("Streaming splits for table: {}", table.getFullTableName());
+                splitter.splitStreaming(
+                        conn,
+                        table,
+                        split -> {
+                            splitQueue.offer(split);
+                            scheduleDrainIfNeeded();
+                        });
             }
-            return allSplits;
+        }
+        LOG.info("Background discovery thread finished.");
+        return null;
+    }
+
+    /**
+     * Schedules a single drain callback on the JM main thread if one is not already pending.
+     *
+     * <p>Called from the background thread after each {@link #splitQueue} offer. The
+     * compare-and-set on {@link #drainScheduled} ensures that many rapid offers only ever queue
+     * one drain callback, preventing mailbox flooding.
+     */
+    private void scheduleDrainIfNeeded() {
+        if (drainScheduled.compareAndSet(false, true)) {
+            context.callAsync(
+                    () -> null,
+                    (ignored, err) -> {
+                        drainScheduled.set(false);
+                        if (err != null) {
+                            LOG.warn("Unexpected error in drain scheduling callback", err);
+                            return;
+                        }
+                        drainQueueAndFulfillBacklog();
+                    });
         }
     }
 
     // -------------------------------------------------------------------------
-    // Callback (runs on JM main thread)
+    // JM main thread — consumes splits from splitQueue, assigns to readers
     // -------------------------------------------------------------------------
 
     /**
-     * Invoked on the JM main thread once {@link #discoverAllSplits()} completes.
+     * Called on the JM main thread when {@link #discoverAndPublishSplits()} completes.
      *
-     * <p>Adds all newly discovered splits to {@link #pendingSplits} and fulfils any backlogged
-     * requests from readers that were waiting.
+     * <p>Performs a final drain of {@link #splitQueue}, marks discovery as done, and fulfils any
+     * readers still in the backlog (either assigning their last split or signalling end-of-input).
      */
-    private void onSplitsDiscovered(List<JdbcSourceSplit> newSplits, Throwable error) {
+    private void onDiscoveryComplete(Void ignored, Throwable error) {
         if (error != null) {
-            LOG.error("Split discovery failed: {}", error.getMessage(), error);
+            LOG.error("Split discovery failed", error);
             throw new RuntimeException("JDBC split discovery failed", error);
         }
-
-        LOG.info("Discovery complete: {} total splits.", newSplits.size());
-        pendingSplits.addAll(newSplits);
+        LOG.info("Discovery complete. Performing final drain.");
+        drainSharedQueue();
         allSplitsCreated = true;
-
-        // Fulfil any readers that requested splits while discovery was in flight.
-        for (Map.Entry<Integer, String> entry : splitRequestBacklog.entrySet()) {
-            assignNextSplitOrEnqueue(entry.getKey());
-        }
-        splitRequestBacklog.clear();
+        fulfillBacklog();
     }
 
-    // -------------------------------------------------------------------------
-    // Internal helpers
-    // -------------------------------------------------------------------------
+    /**
+     * Drains all splits currently in {@link #splitQueue} into {@link #pendingSplits} and then
+     * tries to satisfy any backlogged split requests.
+     *
+     * <p>Runs on the JM main thread (called from the coalesced drain callback).
+     */
+    private void drainQueueAndFulfillBacklog() {
+        int drained = drainSharedQueue();
+        if (drained > 0) {
+            LOG.debug("Drained {} split(s) from queue; fulfilling backlog.", drained);
+            fulfillBacklog();
+        }
+    }
+
+    /**
+     * Moves all currently available splits from the shared {@link #splitQueue} into the JM-local
+     * {@link #pendingSplits}.
+     *
+     * @return the number of splits transferred
+     */
+    private int drainSharedQueue() {
+        int count = 0;
+        JdbcSourceSplit split;
+        while ((split = splitQueue.poll()) != null) {
+            pendingSplits.add(split);
+            count++;
+        }
+        return count;
+    }
+
+    /**
+     * Attempts to assign a queued split to each backlogged reader. Readers for whom no split is
+     * currently available are re-parked in {@link #splitRequestBacklog} (or told "no more splits"
+     * if {@link #allSplitsCreated} is true).
+     */
+    private void fulfillBacklog() {
+        if (splitRequestBacklog.isEmpty()) {
+            return;
+        }
+        List<Integer> waiting = new ArrayList<>(splitRequestBacklog.keySet());
+        splitRequestBacklog.clear();
+        for (int subtaskId : waiting) {
+            assignNextSplitOrEnqueue(subtaskId);
+        }
+    }
 
     /**
      * Tries to assign the next pending split to {@code subtaskId}. If none is available and all
-     * splits have been created, signals end-of-input. If discovery is still in progress, records
-     * the request in the backlog.
+     * splits have been created, signals end-of-input. If discovery is still in progress, re-parks
+     * the request in {@link #splitRequestBacklog}.
      */
     private void assignNextSplitOrEnqueue(int subtaskId) {
         JdbcSourceSplit split = pendingSplits.poll();
@@ -263,13 +354,15 @@ public class JdbcSourceEnumerator
             context.signalNoMoreSplits(subtaskId);
             LOG.debug("No more splits for subtask {}", subtaskId);
         } else {
-            // Discovery in flight; park the request until onSplitsDiscovered is called.
             splitRequestBacklog.put(subtaskId, "pending");
             LOG.debug("Split request from subtask {} parked (discovery in flight)", subtaskId);
         }
     }
 
-    /** Opens a JDBC connection using the configured options. */
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
     private Connection openConnection() throws SQLException {
         try {
             Class.forName(options.resolveDriverName());
